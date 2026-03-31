@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Mehal Lab — Inventory System</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'IBM Plex Sans','Segoe UI',system-ui,sans-serif;background:#f0f2f5;color:#1a1a2e;font-size:14px}
+::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes slideUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+input:focus,select:focus,textarea:focus{border-color:#00356b!important;box-shadow:0 0 0 3px rgba(0,53,107,.1)!important}
+button:hover{filter:brightness(.95)}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useCallback,useMemo,useRef}=React;
+
+// ═══ API Layer ═══
+const API=((base="http://127.0.0.1:8000/api")=>{
+  let token=localStorage.getItem("mlab_token")||null;
+  const headers=()=>({
+    "Content-Type":"application/json",
+    ...(token&&{"Authorization":`Bearer ${token}`})
+  });
+  const f=async(ep,opts={})=>{
+    const r=await fetch(base+ep,{...opts,headers:{...headers(),...(opts.headers||{})}});
+    if(r.status===401){token=null;localStorage.removeItem("mlab_token");throw new Error("Session expired");}
+    const ct=r.headers.get("content-type");
+    if(ct&&ct.includes("text/csv"))return r.blob();
+    if(!r.ok){const e=await r.json().catch(()=>({detail:"Request failed"}));throw new Error(e.detail||"Error");}
+    return r.json();
+  };
+  return{
+    login:async(u,p)=>{const d=await f("/auth/login",{method:"POST",body:JSON.stringify({username:u,password:p})});token=d.access_token;localStorage.setItem("mlab_token",token);return d;},
+    me:()=>f("/auth/me"),
+    logout:()=>{token=null;localStorage.removeItem("mlab_token");},
+    inventory:(params={})=>{const q=new URLSearchParams();Object.entries(params).forEach(([k,v])=>{if(v!=null&&v!=="")q.set(k,v)});return f("/inventory?"+q);},
+    getItem:id=>f(`/inventory/item/${id}`),
+    addItem:d=>f("/inventory",{method:"POST",body:JSON.stringify(d)}),
+    updateItem:(id,d)=>f(`/inventory/${id}`,{method:"PUT",body:JSON.stringify(d)}),
+    deleteItem:id=>f(`/inventory/${id}`,{method:"DELETE"}),
+    useItem:(id,amount,purpose)=>f(`/inventory/${id}/use`,{method:"POST",body:JSON.stringify({amount,purpose})}),
+    checkDuplicate:(cat,name,exId)=>{const q=new URLSearchParams();if(cat)q.set("catalog_number",cat);if(name)q.set("name",name);if(exId)q.set("exclude_id",exId);return f("/inventory/check-duplicate?"+q);},
+    alerts:()=>f("/inventory/alerts"),
+    stats:()=>f("/inventory/stats"),
+    catalog:n=>f(`/inventory/catalog/${encodeURIComponent(n)}`),
+    catalogOnline:n=>f(`/catalog-online/${encodeURIComponent(n)}`),
+    activity:(limit=50)=>f(`/activity?limit=${limit}`),
+    exportCSV:async()=>{const b=await f("/inventory/export/csv");const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download=`mehal_lab_${new Date().toISOString().split("T")[0]}.csv`;a.click();URL.revokeObjectURL(u);},
+  };
+})();
+
+const TYPES=["Antibody","Assay Kit","Bacterial Stock","Cell Line","Chemical","Culture Medium","General","Genotyping_Primer","Oligo","Plasmid","RT-PCR_Primer","Virus"];
+const TCOLORS={"Antibody":"#2563eb","Assay Kit":"#8b5cf6","Bacterial Stock":"#16a34a","Cell Line":"#dc2626","Chemical":"#d97706","Culture Medium":"#0d9488","General":"#ca8a04","Genotyping_Primer":"#c026d3","Oligo":"#7c3aed","Plasmid":"#0891b2","RT-PCR_Primer":"#059669","Virus":"#e11d48"};
+const UNITS=["mL","µL","L","mg","µg","g","kg","units","vials","bottles","tubes","plates","boxes","pieces"];
+const LOCS=["Freezer 1 > Shelf 1","Freezer 1 > Shelf 2","Freezer 1 > Shelf 3 > F","Freezer 2 > Shelf 1","Freezer 2 > Shelf 2","Freezer 3 > Shelf 1 > A","Freezer 3 > Shelf 2","Freezer 3 > Shelf 3 > F","Cold Room > Shelf 1","Cold Room > Shelf 2","Cold Room > Shelf 3","LN2 Tank 1 > Rack 1","LN2 Tank 1 > Rack 2","Room Temp > Cabinet 1","Room Temp > Cabinet 2","Freezer 1 > Shelf 1 > Enzyme Box"];
+
+function TypeBadge({type}){const c=TCOLORS[type]||"#6b7280";return <span style={{display:"inline-flex",alignItems:"center",gap:6,padding:"3px 10px",borderRadius:20,fontSize:12,fontWeight:600,color:c,background:c+"14"}}><span style={{width:8,height:8,borderRadius:"50%",background:c}}></span>{type}</span>;}
+
+function StockBadge({quantity,minStock,unit}){
+  const pct=minStock>0?(quantity/minStock)*100:999;
+  if(pct<=50)return <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"2px 8px",borderRadius:4,fontSize:11,fontWeight:700,color:"#dc2626",background:"#fef2f2",border:"1px solid #fecaca"}}>⚠ Critical: {quantity} {unit}</span>;
+  if(pct<=100)return <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"2px 8px",borderRadius:4,fontSize:11,fontWeight:700,color:"#d97706",background:"#fffbeb",border:"1px solid #fde68a"}}>⚡ Low: {quantity} {unit}</span>;
+  return <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"2px 8px",borderRadius:4,fontSize:11,fontWeight:600,color:"#16a34a",background:"#f0fdf4"}}>✓ {quantity} {unit}</span>;
+}
+
+// ═══ LOGIN PAGE ═══
+function LoginPage({onLogin}){
+  const[u,setU]=useState("");const[p,setP]=useState("");const[err,setErr]=useState("");const[loading,setLoading]=useState(false);
+  const go=async()=>{
+    setLoading(true);setErr("");
+    try{await API.login(u,p);const me=await API.me();onLogin(me);}
+    catch(e){setErr(e.message||"Invalid credentials");}
+    finally{setLoading(false);}
+  };
+  return(
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(160deg,#00356b 0%,#1a5276 40%,#286090 70%,#3d85c6 100%)",padding:20}}>
+      <div style={{background:"#fff",borderRadius:16,padding:"44px 40px 36px",width:"100%",maxWidth:420,boxShadow:"0 25px 80px rgba(0,0,0,.3)"}}>
+        <div style={{textAlign:"center",marginBottom:32}}>
+          <img src={"data:image/png;base64,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"} style={{width:60,height:60,borderRadius:14,marginBottom:14}} alt="Lab Icon" />
+          <div style={{fontSize:22,fontWeight:800,color:"#0f172a"}}>Mehal Lab</div>
+          <div style={{fontSize:13.5,color:"#64748b",marginTop:4}}>Yale School of Medicine — Inventory System</div>
+        </div>
+        <div style={{height:1,background:"#e2e8f0",margin:"20px 0"}}></div>
+        {err&&<div style={{padding:"10px 14px",background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,color:"#dc2626",fontSize:13,textAlign:"center",marginBottom:16}}>{err}</div>}
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          <div style={{display:"flex",flexDirection:"column",gap:5}}>
+            <label style={{fontSize:12,fontWeight:600,color:"#475569",textTransform:"uppercase",letterSpacing:".5px"}}>Username</label>
+            <input style={{padding:"9px 12px",border:"1.5px solid #cbd5e1",borderRadius:7,fontSize:14,outline:"none",fontFamily:"inherit"}} placeholder="Enter your username" value={u} onChange={e=>{setU(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&go()} />
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:5}}>
+            <label style={{fontSize:12,fontWeight:600,color:"#475569",textTransform:"uppercase",letterSpacing:".5px"}}>Password</label>
+            <input style={{padding:"9px 12px",border:"1.5px solid #cbd5e1",borderRadius:7,fontSize:14,outline:"none",fontFamily:"inherit"}} type="password" placeholder="Enter your password" value={p} onChange={e=>{setP(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&go()} />
+          </div>
+          <button style={{width:"100%",padding:12,background:"#00356b",color:"#fff",border:"none",borderRadius:8,fontSize:15,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}} onClick={go} disabled={loading}>{loading?"Signing in...":"Sign In"}</button>
+        </div>
+        <div style={{marginTop:18,padding:"12px 16px",background:"#f0f9ff",borderRadius:8,fontSize:12,color:"#0369a1",border:"1px solid #bae6fd"}}>
+          <strong>Accounts:</strong><br/>PI: Mehal / mehal123<br/>ARS: Arumugam / as3566<br/>Asst. Professor: Xinshou / XO123
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══ ITEM MODAL (Add / Edit) ═══
+function ItemModal({item,onSave,onClose}){
+  const isEdit=Boolean(item);
+  const[form,setForm]=useState(item?{
+    catalog_number:item.catalog_number||"",name:item.name,inventory_type:item.inventory_type,vendor:item.vendor||"",location:item.location||"",position:item.position||"",
+    price:item.price||"",quantity:item.quantity||"",unit:item.unit||"mL",date_received:item.date_received||"",expiration_date:item.expiration_date||"",storage_temp:item.storage_temp||"",min_stock:item.min_stock||"",notes:item.notes||""
+  }:{catalog_number:"",name:"",inventory_type:"Antibody",vendor:"",location:"",position:"",price:"",quantity:"",unit:"mL",date_received:new Date().toISOString().split("T")[0],expiration_date:"",storage_temp:"",min_stock:"",notes:""});
+  const[dupWarn,setDupWarn]=useState(null);const[autoFill,setAutoFill]=useState(null);const catalogTimer=useRef(null);const dupTimer=useRef(null);const[searching,setSearching]=useState(false);
+
+  const handleChange=(k,v)=>{
+    const updated={...form,[k]:v};setForm(updated);
+    if(k==="catalog_number"&&v.length>=3){
+      clearTimeout(catalogTimer.current);
+      catalogTimer.current=setTimeout(async()=>{
+        setSearching(true);setAutoFill(null);
+        try{
+          const m=await API.catalog(v);
+          setForm(prev=>({...prev,name:m.name,inventory_type:m.inventory_type,vendor:m.vendor,price:m.unit_price,storage_temp:m.storage_temp}));
+          setAutoFill("local");setTimeout(()=>setAutoFill(null),4000);
+        }catch{
+          try{
+            const m=await API.catalogOnline(v);
+            if(m.found){
+              setForm(prev=>({...prev,name:m.name||prev.name,inventory_type:m.inventory_type||prev.inventory_type,vendor:m.vendor||prev.vendor,price:m.unit_price||prev.price,storage_temp:m.storage_temp||prev.storage_temp}));
+              setAutoFill("online");setTimeout(()=>setAutoFill(null),5000);
+            }else{setAutoFill("notfound");setTimeout(()=>setAutoFill(null),3000);}
+          }catch{setAutoFill("notfound");setTimeout(()=>setAutoFill(null),3000);}
+        }
+        setSearching(false);
+      },600);
+    }
+    if(k==="catalog_number"||k==="name"){
+      clearTimeout(dupTimer.current);
+      dupTimer.current=setTimeout(async()=>{
+        try{const r=await API.checkDuplicate(updated.catalog_number,updated.name,isEdit?item.id:null);setDupWarn(r.is_duplicate?r:null);}catch{setDupWarn(null);}
+      },500);
+    }
+  };
+
+  const save=async()=>{if(!form.name)return;onSave({...form,price:parseFloat(form.price)||0,quantity:parseFloat(form.quantity)||0,min_stock:parseFloat(form.min_stock)||0},isEdit?item.id:null);};
+
+  const inputStyle={padding:"9px 12px",border:"1.5px solid #cbd5e1",borderRadius:7,fontSize:14,fontFamily:"inherit",outline:"none",background:"#fff",color:"#1a1a2e"};
+  const labelStyle={fontSize:12,fontWeight:600,color:"#475569",textTransform:"uppercase",letterSpacing:".5px"};
+
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,.55)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}} onClick={onClose}>
+      <div style={{background:"#fff",borderRadius:14,width:"90%",maxWidth:720,maxHeight:"90vh",overflow:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.2)"}} onClick={e=>e.stopPropagation()}>
+        <div style={{padding:"20px 28px 16px",borderBottom:"1px solid #e2e8f0",display:"flex",justifyContent:"space-between",alignItems:"center",position:"sticky",top:0,background:"#fff",zIndex:1,borderRadius:"14px 14px 0 0"}}>
+          <div style={{fontSize:18,fontWeight:700,color:"#0f172a"}}>{isEdit?"Edit Item":"Add New Item to Inventory"}</div>
+          <button style={{width:32,height:32,borderRadius:8,border:"none",background:"#f1f5f9",cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center",color:"#64748b"}} onClick={onClose}>✕</button>
+        </div>
+        <div style={{padding:"20px 28px 28px"}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"16px 20px"}}>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}>
+              <label style={labelStyle}>Catalog Number</label>
+              <input style={{...inputStyle,borderColor:searching?"#2563eb":autoFill?"#16a34a":"#cbd5e1"}} placeholder="e.g., 9272S, F3165" value={form.catalog_number} onChange={e=>handleChange("catalog_number",e.target.value)} />
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}>
+              <label style={labelStyle}>Name *</label>
+              <input style={inputStyle} placeholder="Item name" value={form.name} onChange={e=>handleChange("name",e.target.value)} />
+            </div>
+            {searching&&<div style={{gridColumn:"1/-1",padding:"12px 16px",background:"#eff6ff",border:"1px solid #93c5fd",borderRadius:8,color:"#1d4ed8",fontSize:13,fontWeight:500}}>Searching catalog database and online vendors...</div>}
+            {autoFill==="local"&&<div style={{gridColumn:"1/-1",padding:"12px 16px",background:"#f0fdf4",border:"1px solid #4ade80",borderRadius:8,color:"#166534",fontSize:13,fontWeight:500}}>Details auto-populated from local catalog database</div>}
+            {autoFill==="online"&&<div style={{gridColumn:"1/-1",padding:"12px 16px",background:"#f0fdf4",border:"1px solid #4ade80",borderRadius:8,color:"#166534",fontSize:13,fontWeight:500}}>Details found online from vendor website - please verify</div>}
+            {autoFill==="notfound"&&<div style={{gridColumn:"1/-1",padding:"12px 16px",background:"#fefce8",border:"1px solid #fde68a",borderRadius:8,color:"#854d0e",fontSize:13,fontWeight:500}}>Catalog number not found locally or online. Enter details manually.</div>}
+            {dupWarn&&<div style={{gridColumn:"1/-1",padding:"12px 16px",background:"#fffbeb",border:"1px solid #fbbf24",borderRadius:8,color:"#92400e",fontSize:13,fontWeight:500,display:"flex",alignItems:"flex-start",gap:10}}>
+              <span style={{fontSize:20}}>⚠️</span><div><strong>Duplicate Item Detected!</strong><br/><span style={{fontSize:12.5}}>{dupWarn.message}</span></div>
+            </div>}
+            <div style={{display:"flex",flexDirection:"column",gap:5}}>
+              <label style={labelStyle}>Inventory Type *</label>
+              <select style={{...inputStyle,cursor:"pointer"}} value={form.inventory_type} onChange={e=>handleChange("inventory_type",e.target.value)}>{TYPES.map(t=><option key={t}>{t}</option>)}</select>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}><label style={labelStyle}>Vendor</label><input style={inputStyle} value={form.vendor} onChange={e=>handleChange("vendor",e.target.value)} /></div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}>
+              <label style={labelStyle}>Location</label>
+              <input list="location-list" style={inputStyle} placeholder="Type or select location" value={form.location} onChange={e=>handleChange("location",e.target.value)} /><datalist id="location-list">{LOCS.map(l=><option key={l} value={l}/>)}</datalist>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}><label style={labelStyle}>Position / Box</label><input style={inputStyle} placeholder="e.g., A1, Slot 3" value={form.position} onChange={e=>handleChange("position",e.target.value)} /></div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}><label style={labelStyle}>Price ($)</label><input style={inputStyle} type="number" step="0.01" value={form.price} onChange={e=>handleChange("price",e.target.value)} /></div>
+            <div style={{display:"flex",gap:12}}>
+              <div style={{display:"flex",flexDirection:"column",gap:5,flex:2}}><label style={labelStyle}>Quantity</label><input style={inputStyle} type="number" step="any" value={form.quantity} onChange={e=>handleChange("quantity",e.target.value)} /></div>
+              <div style={{display:"flex",flexDirection:"column",gap:5,flex:1}}><label style={labelStyle}>Unit</label><select style={{...inputStyle,cursor:"pointer"}} value={form.unit} onChange={e=>handleChange("unit",e.target.value)}>{UNITS.map(u=><option key={u}>{u}</option>)}</select></div>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}><label style={labelStyle}>Date Received</label><input style={inputStyle} type="date" value={form.date_received} onChange={e=>handleChange("date_received",e.target.value)} /></div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}><label style={labelStyle}>Expiration Date</label><input style={inputStyle} type="date" value={form.expiration_date} onChange={e=>handleChange("expiration_date",e.target.value)} /></div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}><label style={labelStyle}>Storage Temp</label><input style={inputStyle} placeholder="-20°C, 4°C" value={form.storage_temp} onChange={e=>handleChange("storage_temp",e.target.value)} /></div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}><label style={labelStyle}>Min Stock (Low Warning)</label><input style={inputStyle} type="number" step="any" value={form.min_stock} onChange={e=>handleChange("min_stock",e.target.value)} /></div>
+            <div style={{display:"flex",flexDirection:"column",gap:5,gridColumn:"1/-1"}}><label style={labelStyle}>Notes</label><textarea style={{...inputStyle,minHeight:60,resize:"vertical"}} value={form.notes} onChange={e=>handleChange("notes",e.target.value)} /></div>
+          </div>
+        </div>
+        <div style={{display:"flex",justifyContent:"flex-end",gap:10,padding:"16px 28px",borderTop:"1px solid #e2e8f0",background:"#f8fafc",borderRadius:"0 0 14px 14px"}}>
+          <button style={{padding:"9px 20px",background:"#fff",color:"#334155",border:"1.5px solid #cbd5e1",borderRadius:7,cursor:"pointer",fontWeight:500,fontSize:13,fontFamily:"inherit"}} onClick={onClose}>Cancel</button>
+          <button style={{padding:"9px 20px",background:"#00356b",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontWeight:600,fontSize:13,fontFamily:"inherit",opacity:!form.name?.5:1}} onClick={save} disabled={!form.name}>{isEdit?"Save Changes":"Add to Inventory"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══ USE / WITHDRAW MODAL ═══
+function UseModal({item,onConfirm,onClose}){
+  const[amt,setAmt]=useState("");const[purpose,setPurpose]=useState("");
+  const rem=item.quantity-(parseFloat(amt)||0);const isOver=rem<0;const isLow=item.min_stock>0&&rem<=item.min_stock;
+  const inputStyle={padding:"9px 12px",border:"1.5px solid #cbd5e1",borderRadius:7,fontSize:14,fontFamily:"inherit",outline:"none",background:"#fff"};
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,.55)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}} onClick={onClose}>
+      <div style={{background:"#fff",borderRadius:14,width:"90%",maxWidth:480,boxShadow:"0 20px 60px rgba(0,0,0,.2)"}} onClick={e=>e.stopPropagation()}>
+        <div style={{padding:"20px 28px 16px",borderBottom:"1px solid #e2e8f0",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{fontSize:18,fontWeight:700}}>Withdraw: {item.name}</div>
+          <button style={{width:32,height:32,borderRadius:8,border:"none",background:"#f1f5f9",cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={onClose}>✕</button>
+        </div>
+        <div style={{padding:"20px 28px 28px"}}>
+          <div style={{marginBottom:16,padding:"12px 16px",background:"#f0f9ff",borderRadius:8,border:"1px solid #bae6fd"}}><strong>Current Stock:</strong> {item.quantity} {item.unit}{item.min_stock>0&&<span style={{color:"#64748b"}}> (Min: {item.min_stock} {item.unit})</span>}</div>
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}><label style={{fontSize:12,fontWeight:600,color:"#475569",textTransform:"uppercase"}}>Amount ({item.unit})</label><input style={inputStyle} type="number" step="any" value={amt} onChange={e=>setAmt(e.target.value)} autoFocus /></div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}><label style={{fontSize:12,fontWeight:600,color:"#475569",textTransform:"uppercase"}}>Purpose (optional)</label><input style={inputStyle} placeholder="e.g., Western Blot" value={purpose} onChange={e=>setPurpose(e.target.value)} /></div>
+            {amt&&!isOver&&<div style={{padding:"10px 14px",background:"#f8fafc",borderRadius:8,fontSize:13}}>Remaining: <strong>{rem.toFixed(2)} {item.unit}</strong></div>}
+            {isOver&&<div style={{padding:"12px 16px",background:"#fef2f2",border:"1px solid #fca5a5",borderRadius:8,color:"#991b1b",fontSize:13}}>🚫 Cannot withdraw more than {item.quantity} {item.unit}</div>}
+            {isLow&&!isOver&&parseFloat(amt)>0&&<div style={{padding:"12px 16px",background:"#fffbeb",border:"1px solid #fbbf24",borderRadius:8,color:"#92400e",fontSize:13}}>⚠️ <strong>Low Stock Warning!</strong> Stock will be below minimum ({item.min_stock} {item.unit}). Consider reordering.</div>}
+          </div>
+        </div>
+        <div style={{display:"flex",justifyContent:"flex-end",gap:10,padding:"16px 28px",borderTop:"1px solid #e2e8f0",background:"#f8fafc",borderRadius:"0 0 14px 14px"}}>
+          <button style={{padding:"9px 20px",background:"#fff",color:"#334155",border:"1.5px solid #cbd5e1",borderRadius:7,cursor:"pointer",fontWeight:500,fontSize:13,fontFamily:"inherit"}} onClick={onClose}>Cancel</button>
+          <button style={{padding:"9px 20px",background:"#16a34a",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontWeight:600,fontSize:13,fontFamily:"inherit",opacity:(!amt||isOver)?.5:1}} onClick={()=>onConfirm(parseFloat(amt),purpose)} disabled={!amt||isOver}>Confirm Withdrawal</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══ MAIN APP ═══
+function App(){
+  const[user,setUser]=useState(null);const[inventory,setInventory]=useState([]);const[stats,setStats]=useState({total_items:0,in_stock:0,low_stock:0,expired:0,total_value:0});
+  const[search,setSearch]=useState("");const[typeFilter,setTypeFilter]=useState([]);const[sortBy,setSortBy]=useState("name");const[sortDir,setSortDir]=useState("asc");
+  const[page,setPage]=useState(1);const[totalPages,setTotalPages]=useState(1);const[total,setTotal]=useState(0);
+  const[view,setView]=useState("inventory");const[showAdd,setShowAdd]=useState(false);const[editItem,setEditItem]=useState(null);
+  const[useItem,setUseItem]=useState(null);const[toast,setToast]=useState(null);const[actLog,setActLog]=useState([]);const[alerts,setAlerts]=useState({low_stock:[],expired:[]});
+  const timer=useRef(null);const searchTimer=useRef(null);
+
+  const showToast=(msg,type="success")=>{clearTimeout(timer.current);setToast({msg,type});timer.current=setTimeout(()=>setToast(null),3500);};
+
+  // Auto-login if token exists
+  useEffect(()=>{(async()=>{try{const me=await API.me();setUser(me);}catch{API.logout();}})();},[]);
+
+  // Load inventory
+  const loadInventory=useCallback(async()=>{
+    if(!user)return;
+    try{
+      const data=await API.inventory({search,inventory_type:typeFilter.join(","),sort_by:sortBy,sort_dir:sortDir,page,per_page:15});
+      setInventory(data.items);setTotalPages(data.total_pages);setTotal(data.total);
+    }catch(e){showToast(e.message,"error");}
+  },[user,search,typeFilter,sortBy,sortDir,page]);
+
+  const loadStats=useCallback(async()=>{if(!user)return;try{setStats(await API.stats());}catch{}},[user]);
+  const loadAlerts=useCallback(async()=>{if(!user)return;try{setAlerts(await API.alerts());}catch{}},[user]);
+  const loadActivity=useCallback(async()=>{if(!user)return;try{setActLog(await API.activity(50));}catch{}},[user]);
+
+  useEffect(()=>{loadInventory();loadStats();},[loadInventory,loadStats]);
+  useEffect(()=>{if(view==="alerts")loadAlerts();if(view==="activity")loadActivity();},[view,loadAlerts,loadActivity]);
+
+  // Debounced search
+  const handleSearch=v=>{setSearch(v);setPage(1);};
+
+  const handleSort=field=>{if(sortBy===field)setSortDir(d=>d==="asc"?"desc":"asc");else{setSortBy(field);setSortDir("asc");}};
+  const toggleType=t=>{setTypeFilter(prev=>prev.includes(t)?prev.filter(x=>x!==t):[...prev,t]);setPage(1);};
+
+  const handleSave=async(formData,editId)=>{
+    try{
+      if(editId){await API.updateItem(editId,formData);showToast("Item updated!");}
+      else{await API.addItem(formData);showToast("Item added to inventory!");}
+      setShowAdd(false);setEditItem(null);loadInventory();loadStats();
+    }catch(e){showToast(e.message,"error");}
+  };
+
+  const handleUse=async(amount,purpose)=>{
+    try{
+      const updated=await API.useItem(useItem.id,amount,purpose);
+      if(useItem.min_stock>0&&(useItem.quantity-amount)<=useItem.min_stock)showToast(`Low stock: ${useItem.name}`,"warning");
+      else showToast(`Withdrew ${amount} ${useItem.unit}`);
+      setUseItem(null);loadInventory();loadStats();
+    }catch(e){showToast(e.message,"error");}
+  };
+
+  const handleDelete=async(item)=>{
+    if(!window.confirm(`Remove "${item.name}" from inventory?`))return;
+    try{await API.deleteItem(item.id);showToast(`${item.name} removed`,"error");loadInventory();loadStats();}catch(e){showToast(e.message,"error");}
+  };
+
+  if(!user)return <LoginPage onLogin={setUser}/>;
+
+  const SortArr=({f})=>sortBy===f?<span style={{marginLeft:4,opacity:.7}}>{sortDir==="asc"?"▲":"▼"}</span>:null;
+
+  // Count items by type from stats (use inventory for sidebar counts)
+  const typeCounts={};inventory.forEach(i=>{typeCounts[i.inventory_type]=(typeCounts[i.inventory_type]||0)+1;});
+
+  return(
+    <div style={{minHeight:"100vh",background:"#f0f2f5"}}>
+      {/* HEADER */}
+      <div style={{background:"linear-gradient(135deg,#00356b 0%,#1a5276 50%,#286090 100%)",padding:"0 24px",display:"flex",alignItems:"center",justifyContent:"space-between",height:60,boxShadow:"0 2px 8px rgba(0,53,107,.3)",position:"sticky",top:0,zIndex:100}}>
+        <div style={{display:"flex",alignItems:"center",gap:16}}>
+          <div style={{color:"#fff",fontSize:20,fontWeight:700,display:"flex",alignItems:"center",gap:10}}>
+            <img src={"data:image/png;base64,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"} style={{width:36,height:36,borderRadius:8}} alt="Lab Icon" />
+            <div>Mehal Lab<span style={{fontSize:11,fontWeight:400,opacity:.7,display:"block",marginTop:-2}}>Yale School of Medicine — Inventory</span></div>
+          </div>
+          <div style={{display:"flex",gap:2}}>
+            {["inventory","alerts","activity"].map(v=>(
+              <button key={v} style={{padding:"8px 18px",background:view===v?"rgba(255,255,255,.2)":"transparent",border:"none",color:"#fff",borderRadius:6,cursor:"pointer",fontWeight:view===v?600:400,fontSize:13.5,fontFamily:"inherit",textTransform:"capitalize"}} onClick={()=>setView(v)}>
+                {v}{v==="alerts"&&(alerts.low_stock.length+alerts.expired.length>0||stats.low_stock+stats.expired>0)&&<span style={{background:"#ef4444",color:"#fff",borderRadius:10,padding:"1px 7px",fontSize:11,fontWeight:700,marginLeft:4}}>{stats.low_stock+stats.expired}</span>}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:16}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,color:"#fff"}}>
+            <div style={{width:34,height:34,borderRadius:"50%",background:"rgba(255,255,255,.2)",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:14,border:"2px solid rgba(255,255,255,.3)"}}>{user.full_name.split(" ").map(n=>n[0]).join("")}</div>
+            <div><div style={{fontWeight:600,fontSize:13.5}}>{user.full_name}</div><div style={{fontSize:11,opacity:.7}}>{user.role}</div></div>
+          </div>
+          <button style={{padding:"6px 14px",background:"rgba(255,255,255,.12)",border:"1px solid rgba(255,255,255,.25)",color:"#fff",borderRadius:6,cursor:"pointer",fontSize:12.5,fontFamily:"inherit"}} onClick={()=>{API.logout();setUser(null);}}>Sign Out</button>
+        </div>
+      </div>
+
+      <div style={{display:"flex",minHeight:"calc(100vh - 60px)"}}>
+        {/* SIDEBAR */}
+        <div style={{width:250,background:"#fff",borderRight:"1px solid #e2e8f0",padding:"20px 0",flexShrink:0,overflowY:"auto"}}>
+          <div style={{padding:"0 20px",marginBottom:24}}>
+            <div style={{fontSize:10.5,fontWeight:700,textTransform:"uppercase",letterSpacing:"1.2px",color:"#64748b",marginBottom:10}}>Inventory Types</div>
+            {TYPES.map(type=>(
+              <button key={type} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 10px",borderRadius:6,cursor:"pointer",background:typeFilter.includes(type)?`${TCOLORS[type]}12`:"transparent",border:"none",width:"100%",textAlign:"left",fontSize:13,color:typeFilter.includes(type)?TCOLORS[type]:"#475569",fontWeight:typeFilter.includes(type)?600:400,fontFamily:"inherit"}} onClick={()=>toggleType(type)}>
+                <span style={{width:10,height:10,borderRadius:"50%",background:TCOLORS[type],flexShrink:0}}></span>{type}
+                <span style={{marginLeft:"auto",fontSize:11,color:"#94a3b8"}}>{typeCounts[type]||0}</span>
+              </button>
+            ))}
+            {typeFilter.length>0&&<button style={{display:"flex",alignItems:"center",gap:8,padding:"6px 10px",borderRadius:6,cursor:"pointer",background:"transparent",border:"none",width:"100%",textAlign:"left",fontSize:12,color:"#2563eb",fontWeight:600,fontFamily:"inherit",marginTop:8}} onClick={()=>{setTypeFilter([]);setPage(1);}}>✕ Clear Filters</button>}
+          </div>
+          <div style={{padding:"0 20px",marginBottom:24}}>
+            <div style={{fontSize:10.5,fontWeight:700,textTransform:"uppercase",letterSpacing:"1.2px",color:"#64748b",marginBottom:10}}>Quick Stats</div>
+            <div style={{fontSize:12.5,color:"#475569",display:"flex",flexDirection:"column",gap:8}}>
+              {[["Total Items",stats.total_items],["Low Stock",stats.low_stock,"#d97706"],["Expired",stats.expired,"#dc2626"],["Total Value","$"+stats.total_value.toLocaleString("en-US",{minimumFractionDigits:2})]].map(([l,v,c])=>(
+                <div key={l} style={{display:"flex",justifyContent:"space-between"}}><span>{l}</span><strong style={{color:c||"inherit"}}>{v}</strong></div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* MAIN */}
+        <div style={{flex:1,padding:"24px 28px",overflowX:"auto"}}>
+          {view==="inventory"&&<>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:12}}>
+              <div style={{fontSize:22,fontWeight:700,color:"#0f172a"}}>Search Inventory</div>
+              <div style={{display:"flex",alignItems:"center",background:"#fff",border:"1.5px solid #cbd5e1",borderRadius:8,padding:"0 14px",gap:8,flex:"0 1 380px"}}>
+                <span style={{color:"#94a3b8",fontSize:16}}>🔍</span>
+                <input style={{border:"none",outline:"none",padding:"10px 0",fontSize:14,flex:1,fontFamily:"inherit",background:"transparent"}} placeholder="Search name, catalog#, vendor, type, location..." value={search} onChange={e=>handleSearch(e.target.value)} />
+                {search&&<button style={{border:"none",background:"none",cursor:"pointer",color:"#94a3b8",fontSize:16}} onClick={()=>handleSearch("")}>✕</button>}
+              </div>
+              <div style={{display:"flex",gap:10}}>
+                <button style={{padding:"9px 20px",background:"#00356b",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontWeight:600,fontSize:13,fontFamily:"inherit",display:"flex",alignItems:"center",gap:6}} onClick={()=>setShowAdd(true)}>+ Add Item</button>
+                <button style={{padding:"9px 20px",background:"#fff",color:"#334155",border:"1.5px solid #cbd5e1",borderRadius:7,cursor:"pointer",fontWeight:500,fontSize:13,fontFamily:"inherit"}} onClick={()=>API.exportCSV().then(()=>showToast("Exported!"))}>↓ Export CSV</button>
+              </div>
+            </div>
+
+            <div style={{display:"flex",gap:14,marginBottom:22,flexWrap:"wrap"}}>
+              {[["Total Items",stats.total_items,"#00356b"],["In Stock",stats.in_stock,"#16a34a"],["Low Stock",stats.low_stock,"#d97706"],["Expired",stats.expired,"#dc2626"]].map(([l,v,c])=>(
+                <div key={l} style={{background:"#fff",borderRadius:10,padding:"16px 22px",flex:"1 1 180px",minWidth:160,borderLeft:`4px solid ${c}`,boxShadow:"0 1px 3px rgba(0,0,0,.06)"}}>
+                  <div style={{fontSize:11,fontWeight:600,textTransform:"uppercase",letterSpacing:".8px",color:"#64748b",marginBottom:4}}>{l}</div>
+                  <div style={{fontSize:26,fontWeight:800,color:v>0&&(l==="Low Stock"||l==="Expired")?c:"#0f172a",letterSpacing:"-1px"}}>{v}</div>
+                </div>
+              ))}
+            </div>
+
+            <table style={{width:"100%",background:"#fff",borderRadius:10,overflow:"hidden",boxShadow:"0 1px 4px rgba(0,0,0,.07)",borderCollapse:"collapse"}}>
+              <thead><tr>
+                {[["name","Name"],["location","Location"],["inventory_type","Type"],["price","Price"],["quantity","Quantity"],["date_received","Date Received"]].map(([f,l])=>(
+                  <th key={f} style={{textAlign:"left",padding:"12px 16px",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:".8px",color:"#475569",background:"#f8fafc",borderBottom:"2px solid #e2e8f0",whiteSpace:"nowrap",cursor:"pointer",userSelect:"none"}} onClick={()=>handleSort(f)}>{l}<SortArr f={f}/></th>
+                ))}
+                <th style={{textAlign:"left",padding:"12px 16px",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:".8px",color:"#475569",background:"#f8fafc",borderBottom:"2px solid #e2e8f0"}}>Actions</th>
+              </tr></thead>
+              <tbody>
+                {inventory.length===0&&<tr><td colSpan={7} style={{padding:40,textAlign:"center",color:"#94a3b8",borderBottom:"1px solid #f1f5f9"}}>No items found.</td></tr>}
+                {inventory.map(item=>{
+                  const isLow=item.min_stock>0&&item.quantity<=item.min_stock;
+                  const isExp=item.expiration_date&&item.expiration_date!=="N/A"&&new Date(item.expiration_date)<new Date();
+                  return(
+                    <tr key={item.id} style={{background:isExp?"#fef2f2":isLow?"#fffbeb":"transparent",cursor:"pointer",transition:"background .1s"}}>
+                      <td style={{padding:"11px 16px",borderBottom:"1px solid #f1f5f9",fontSize:13.5}}><div style={{fontWeight:600,color:"#0f172a"}}>{item.name}</div><div style={{fontSize:11,color:"#94a3b8"}}>Cat# {item.catalog_number||"N/A"}</div></td>
+                      <td style={{padding:"11px 16px",borderBottom:"1px solid #f1f5f9",fontSize:12.5}}><div>{item.location||"—"}</div>{item.position&&<div style={{fontSize:11,color:"#94a3b8"}}>{item.position}</div>}</td>
+                      <td style={{padding:"11px 16px",borderBottom:"1px solid #f1f5f9"}}><TypeBadge type={item.inventory_type}/></td>
+                      <td style={{padding:"11px 16px",borderBottom:"1px solid #f1f5f9",fontSize:13.5}}>{item.price?"$"+item.price.toFixed(2):"—"}</td>
+                      <td style={{padding:"11px 16px",borderBottom:"1px solid #f1f5f9"}}><StockBadge quantity={item.quantity} minStock={item.min_stock} unit={item.unit}/></td>
+                      <td style={{padding:"11px 16px",borderBottom:"1px solid #f1f5f9",fontSize:13.5}}>{item.date_received||"—"}</td>
+                      <td style={{padding:"11px 16px",borderBottom:"1px solid #f1f5f9"}}>
+                        <div style={{display:"flex",gap:4}}>
+                          <button style={{color:"#16a34a",fontWeight:600,fontSize:12.5,cursor:"pointer",border:"none",background:"none",fontFamily:"inherit",padding:"4px 8px",borderRadius:4}} onClick={()=>setUseItem(item)}>Use</button>
+                          <button style={{color:"#00356b",fontWeight:600,fontSize:12.5,cursor:"pointer",border:"none",background:"none",fontFamily:"inherit",padding:"4px 8px",borderRadius:4}} onClick={()=>{setEditItem(item);setShowAdd(true);}}>Edit</button>
+                          <button style={{color:"#dc2626",fontWeight:600,fontSize:12.5,cursor:"pointer",border:"none",background:"none",fontFamily:"inherit",padding:"4px 8px",borderRadius:4}} onClick={()=>handleDelete(item)}>✕</button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+
+            {totalPages>1&&<div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:16,padding:"12px 16px",background:"#fff",borderRadius:10,boxShadow:"0 1px 3px rgba(0,0,0,.05)"}}>
+              <span style={{fontSize:13,color:"#64748b"}}>Showing {((page-1)*15)+1}–{Math.min(page*15,total)} of {total}</span>
+              <div style={{display:"flex",gap:6}}>
+                <button style={{padding:"6px 14px",border:"1.5px solid #cbd5e1",borderRadius:6,background:page===1?"#f1f5f9":"#fff",color:page===1?"#94a3b8":"#334155",cursor:page===1?"default":"pointer",fontSize:13,fontFamily:"inherit"}} onClick={()=>setPage(p=>Math.max(1,p-1))} disabled={page===1}>← Prev</button>
+                {Array.from({length:totalPages},(_,i)=>i+1).slice(Math.max(0,page-3),page+2).map(p=>(
+                  <button key={p} style={{padding:"6px 14px",border:"1.5px solid #cbd5e1",borderRadius:6,background:p===page?"#00356b":"#fff",color:p===page?"#fff":"#334155",fontWeight:p===page?700:500,fontSize:13,cursor:"pointer",fontFamily:"inherit"}} onClick={()=>setPage(p)}>{p}</button>
+                ))}
+                <button style={{padding:"6px 14px",border:"1.5px solid #cbd5e1",borderRadius:6,background:page===totalPages?"#f1f5f9":"#fff",color:page===totalPages?"#94a3b8":"#334155",cursor:page===totalPages?"default":"pointer",fontSize:13,fontFamily:"inherit"}} onClick={()=>setPage(p=>Math.min(totalPages,p+1))} disabled={page===totalPages}>Next →</button>
+              </div>
+            </div>}
+          </>}
+
+          {view==="alerts"&&<>
+            <div style={{fontSize:22,fontWeight:700,color:"#0f172a",marginBottom:20}}>Alerts & Warnings</div>
+            {alerts.low_stock.length===0&&alerts.expired.length===0&&<div style={{background:"#f0fdf4",border:"1px solid #4ade80",borderRadius:10,padding:30,textAlign:"center",color:"#166534",fontWeight:500}}>✅ No alerts! All inventory levels are healthy.</div>}
+            {alerts.expired.length>0&&<div style={{marginBottom:24}}>
+              <div style={{fontSize:16,fontWeight:700,color:"#dc2626",marginBottom:12}}>🚫 Expired Items ({alerts.expired.length})</div>
+              {alerts.expired.map(item=><div key={item.id} style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,padding:"14px 18px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontWeight:600,color:"#991b1b"}}>{item.name}</div><div style={{fontSize:12,color:"#b91c1c"}}>Expired: {item.expiration_date} | Location: {item.location}</div></div></div>)}
+            </div>}
+            {alerts.low_stock.length>0&&<div>
+              <div style={{fontSize:16,fontWeight:700,color:"#d97706",marginBottom:12}}>⚠️ Low Stock ({alerts.low_stock.length})</div>
+              {alerts.low_stock.map(item=><div key={item.id} style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,padding:"14px 18px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontWeight:600,color:"#92400e"}}>{item.name}</div><div style={{fontSize:12,color:"#a16207"}}>Stock: {item.quantity} {item.unit} (Min: {item.min_stock} {item.unit}) | Vendor: {item.vendor}</div></div></div>)}
+            </div>}
+          </>}
+
+          {view==="activity"&&<>
+            <div style={{fontSize:22,fontWeight:700,color:"#0f172a",marginBottom:20}}>Activity Log</div>
+            <div style={{background:"#fff",borderRadius:10,boxShadow:"0 1px 4px rgba(0,0,0,.07)",overflow:"hidden"}}>
+              {actLog.length===0&&<div style={{padding:20,color:"#94a3b8",textAlign:"center"}}>No activity yet.</div>}
+              {actLog.map(log=>(
+                <div key={log.id} style={{padding:"12px 20px",borderBottom:"1px solid #f1f5f9",display:"flex",gap:12,alignItems:"flex-start",fontSize:13}}>
+                  <div style={{width:28,height:28,borderRadius:"50%",background:"#e0f2fe",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:11,color:"#0369a1",flexShrink:0}}>{(log.user_name||"?").split(" ").map(n=>n[0]).join("")}</div>
+                  <div style={{flex:1}}><span style={{fontWeight:600}}>{log.user_name}</span> <span style={{color:"#64748b"}}>{log.action_description}</span> <span style={{fontWeight:600}}>{log.item_name}</span>{log.detail&&<span style={{color:"#64748b"}}> — {log.detail}</span>}
+                    <div style={{fontSize:11,color:"#94a3b8",marginTop:3}}>{log.timestamp?new Date(log.timestamp).toLocaleString():""}</div>
+                  </div>
+                  <span style={{padding:"2px 8px",borderRadius:4,fontSize:10.5,fontWeight:700,textTransform:"uppercase",
+                    background:log.action_type==="add"?"#f0fdf4":log.action_type==="edit"?"#f0f9ff":log.action_type==="use"?"#fffbeb":"#fef2f2",
+                    color:log.action_type==="add"?"#16a34a":log.action_type==="edit"?"#2563eb":log.action_type==="use"?"#d97706":"#dc2626"
+                  }}>{log.action_type}</span>
+                </div>
+              ))}
+            </div>
+          </>}
+        </div>
+      </div>
+
+      {(showAdd||editItem)&&<ItemModal item={editItem} onSave={handleSave} onClose={()=>{setShowAdd(false);setEditItem(null);}} />}
+      {useItem&&<UseModal item={useItem} onConfirm={handleUse} onClose={()=>setUseItem(null)} />}
+      {toast&&<div style={{position:"fixed",bottom:28,right:28,padding:"14px 22px",borderRadius:10,color:"#fff",fontWeight:600,fontSize:13.5,zIndex:300,boxShadow:"0 8px 30px rgba(0,0,0,.2)",display:"flex",alignItems:"center",gap:10,animation:"slideUp .3s ease",background:toast.type==="success"?"#16a34a":toast.type==="warning"?"#d97706":"#dc2626"}}>{toast.type==="success"?"✓":toast.type==="warning"?"⚠":"✕"} {toast.msg}</div>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
